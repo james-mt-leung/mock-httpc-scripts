@@ -23,19 +23,18 @@ class RequestHandler {
     private static final String DELIVERY_RECEIPT_PATH = "/callbacks/openmarket/api-deliveryReceipt";
     private static final String RESPONSE_PATH = "/callbacks/openmarket/api-userResponse";
 
-    private static final boolean enableSegments = true;
     private static final int segmentSplitLength = 90;
 
     Map handleRequest(Request request) {
         logger.info("Request received for: ${request.form.collect { key, value -> "[${key} : ${value}]" }.join(" ")}");
 
-        // Determine number of segments and send a delivery receipt
         def eventId = request.form.find { key, value -> key == "event_id" }?.value
         def orgId = request.form.find { key, value -> key == "org_id" }?.value
+        def message = request.form.find { key, value -> key == "message" }?.value
 
         def url = "http://" + HOST + ":" + PORT + DELIVERY_RECEIPT_PATH
         logger.info("Will schedule response to ${url} in 0s")
-        pool.schedule(new ResponseHandler(url, orgId, eventId), 1, TimeUnit.MILLISECONDS)
+        pool.schedule(new DeliveryReceiptHandler(segmentSplitLength, url, orgId, eventId, message), 1, TimeUnit.MILLISECONDS)
 
         return [HttpStatus: 200]
     }
@@ -44,57 +43,66 @@ class RequestHandler {
 class DeliveryReceiptHandler implements Runnable {
     private static final Logger logger = Logger.getLogger(DeliveryReceiptHandler.class)
     private static HttpClient client = null;
-    private final Map responseMap;
-    private final int numberOfSegments;
+    final def url
+    final def orgId
+    final def eventId
+    final def segmentSplitLength
+    final int numberOfSegments
 
-    DeliveryReceiptHandler(Map responseInfo, int numberOfSegments) {
-        this.responseMap = responseInfo
-        this.numberOfSegments = numberOfSegments;
+    DeliveryReceiptHandler(segmentSplitLength, String url, def orgId, def eventId, String message) {
+        this.url = url
+        this.orgId = orgId
+        this.eventId = eventId
+        this.segmentSplitLength = segmentSplitLength
+        // number of whole parts (ex. rounded up)
+        this.numberOfSegments = (message.length() + segmentSplitLength - 1) / segmentSplitLength
     }
 
     @Override
     void run() {
-
         def postBody = """
-            <deliveryReceipt note="${responseMap.note}" ticketId="${responseMap.ticketId}">
-                <response description="Message successfully sent to carrier." code="0"/>
+            <deliveryReceipt note="{'orgId': ${orgId}, 'eventId': ${eventId}}" ticketId='1'>
+                <response description="Message successfully sent to carrier." code='4'/>
                 <message>
                     <state description="Delivered to carrier" id="3"/>
                     <reason description="Message successfully sent to carrier." code="0"/>
                 </message>
             </deliveryReceipt>
-        """;
-        if (numberOfSegments && numberOfSegments > 1) {
+        """
+        if (numberOfSegments > 1) {
+            logger.info("Will send a totol of $numberOfSegments delivery receipt")
             for (int i = 1; i <= numberOfSegments; i++) {
                 postBody = """
-                    <deliveryReceipt note="${responseMap.note}" ticketId="${responseMap.ticketId}">
-                        <response description="Message successfully sent to carrier." code="0"/>
-                        <message segmentNumber="${i}">
-                            <state description="Delivered to carrier" id="3"/>
-                            <reason description="Message successfully sent to carrier." code="0"/>
-                        </message>
-                    </deliveryReceipt>
+                <deliveryReceipt note="{'orgId': ${orgId}, 'eventId': ${eventId}}" ticketId='1'>
+                    <response description="Message successfully sent to carrier." code='4'/>
+                    <message segmentNumber="$i">
+                        <state description="Delivered to carrier" id="3"/>
+                        <reason description="Message successfully sent to carrier." code="0"/>
+                    </message>
+                </deliveryReceipt>
                 """
-                doPost(postBody);
+                doPost(postBody)
             }
         } else {
-            doPost(postBody);
+            doPost(postBody)
         }
     }
 
     void doPost(String postBody) {
+        logger.info("post body ${postBody}")
+
         StringEntity requestEntity = new StringEntity(
                 postBody,
                 "application/json",
                 "UTF-8");
 
-        HttpPost httpPost = new HttpPost(responseMap.url);
+        HttpPost httpPost = new HttpPost(url);
         try {
             httpPost.setEntity(requestEntity)
             HttpResponse response = getClient().execute(httpPost)
-            logger.info("PostMethod ${responseMap.url} return code: ${response.statusLine.statusCode}.")
+            logger.info("PostMethod ${url} return code: ${response.statusLine.statusCode}.")
         } catch (Exception e) {
-            logger.error("PostMethod ${responseMap.url}.", e)
+            logger.error("PostMethod ${url}.", e)
             e.printStackTrace()
         } finally {
             httpPost.releaseConnection()
@@ -113,74 +121,6 @@ class DeliveryReceiptHandler implements Runnable {
         }
 
         return client
-    }
-}
-
-class ResponseHandler implements Runnable {
-    private static final Logger logger = Logger.getLogger(ResponseHandler.class)
-    static HttpClient client = null;
-    final def url
-    final def orgId
-    final def eventId
-
-    ResponseHandler(def url, def orgId, def eventId) {
-        this.url = url
-        this.orgId = orgId
-        this.eventId = eventId
-    }
-
-    @Override
-    void run() {
-        def postBody = """
-            <deliveryReceipt note="{'orgId': ${orgId}, 'eventId': ${eventId}}" ticketId='1'>
-                <response description="Message successfully sent to carrier." code='4'/>
-                <message>
-                    <state description="Delivered to carrier" id="3"/>
-                    <reason description="Message successfully sent to carrier." code="0"/>
-                </message>
-            </deliveryReceipt>
-        """;
-
-        doPost(postBody);
-    }
-
-    void doPost(String postBody) {
-        StringEntity requestEntity = new StringEntity(
-                postBody,
-                "application/json",
-                "UTF-8");
-
-        logger.info("post body ${postBody}")
-
-        HttpPost httpPost = new HttpPost(url);
-        try {
-            httpPost.setEntity(requestEntity)
-            HttpResponse response = getClient().execute(httpPost)
-            logger.info("PostMethod ${url} return code: ${response.statusLine.statusCode}.")
-        } catch (Exception e) {
-            logger.error("PostMethod ${url}.", e)
-            e.printStackTrace()
-        } finally {
-            httpPost.releaseConnection()
-        }
-    }
-
-    static HttpClient getClient() {
-        if (!client) {
-            PoolingHttpClientConnectionManager cm = new PoolingHttpClientConnectionManager();
-// Increase max total connection to 200
-            cm.setMaxTotal(200);
-            // Increase default max connection per route to 20
-            cm.setDefaultMaxPerRoute(20);
-
-            client = HttpClientBuilder.create().setConnectionManager(cm).build()
-        }
-
-        return client
-    }
-
-    public String toHex(String arg) {
-        return String.format("%040x", new BigInteger(1, arg.getBytes("US-ASCII")));
     }
 }
 
